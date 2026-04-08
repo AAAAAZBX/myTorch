@@ -70,6 +70,8 @@ class Tensor:
 
 这样便可以知道每个值的子项，并且能够追溯到是哪个运算操作生成了这个值。
 
+这一步我当时踩过一个命名坑：`prev` 和 `_prev` 混用会导致后面的 `trace()` 直接报错，建议从这里开始统一字段名。
+
 为了更加直观地可视化整个计算图，要在类中加入 label 来标识各个变量名，使用下面的代码.(具体实现方式可以不必深究，知道其能够显示计算图的拓扑顺序即可)
 
 ```python
@@ -123,7 +125,7 @@ dot.render("tensor_graph", view=True)
 
 运行结果:
 
-![tensor_graph](./tensor_graph.svg)
+![tensor_graph](./bp_result/tensor_graph.svg)
 
 ## 反向传播
 
@@ -205,9 +207,7 @@ def diff_on_c():
 - 对 $c$ 扰动时，变化率恒为 $1$。
 
 
-
-
-这些结果说明了一个核心事实：每个局部变化率都可以通过链式法则一路传递到最终输出，这正是反向传播的本质。  
+这些结果说明了一个事实：每个局部变化率都可以通过链式法则一路传递到最终输出，这正是反向传播的本质。  
 接下来将不再用数值扰动估计梯度，而是基于计算图实现自动反向传播。
 
 ### 链式法则到反向传播
@@ -278,7 +278,120 @@ class Tensor:
             v._backward()
 ```
 
+`backward()` 里最容易漏的是 `topo.append(v)` 这行，少了它就会出现“反传执行了但梯度不更新”的假象。
 
+```python
+dot = draw_dot(d)
+dot.render("tensor_graph", view=True)
+```
+
+![tensor_graph2](./bp_result/tensor_graph2.svg)
+
+有了加法和乘法的反向传播代码,再加上激活函数（激活函数先使用最简单的ReLU），就可以据此实现一个简单的神经元
+
+![neural](./neural.png)
+
+```python
+x0 = Tensor(1.0, label='x0')
+w0 = Tensor(-2.0, label='w0')
+x1 = Tensor(-3.0, label='x1')
+w1 = Tensor(4.0, label='w1')
+b = Tensor(7.0, label='b')
+x0w0 = x0 * w0; x0w0.label = 'x0w0'
+x1w1 = x1 * w1; x1w1.label = 'x1w1'
+x0w0x1w1 = x0w0 + x1w1; x0w0x1w1.label = 'x0w0x1w1'
+Sum = x0w0x1w1 + b; Sum.label = 'Sum'
+output = Sum.relu(); output.label = 'output'
+output.backward()
+
+dot = draw_dot(output)
+dot.render("neural_graph", view=True)
+```
+
+得到的计算图如下：
+
+![neural](./bp_result/neural_graph.svg)
+
+## 以tanh为例子验证代码正确性
+
+下面把 ReLU 替换为 tanh 激活函数，采用两种方式实现来验证反向传播正确性
+
+### 直接调用tanh函数
+
+tanh 的原函数表达式为：
+
+$$
+\tanh(x)=\frac{e^x-e^{-x}}{e^x+e^{-x}}
+$$
+
+tanh 的导函数为：
+
+$$
+\frac{d}{dx}\tanh(x)=1-\tanh^2(x)
+$$
+
+代码如下：
+
+```python
+def tanh(self):
+    out = Tensor(np.tanh(self.data), (self,), 'tanh')
+    def _backward():
+        self.grad += (1 - np.tanh(self.data) ** 2) * out.grad
+    out._backward = _backward
+    return out
+```
+
+主函数调用和最终运行结果如下(这里为了让结果显示的更加精确一点，backward 里面的最终结果的初始 grad 设置为了 1000.0)：
+
+```python
+x0 = Tensor(1.0, label='x0')
+w0 = Tensor(2.0, label='w0')
+x1 = Tensor(3.0, label='x1')
+w1 = Tensor(4.0, label='w1')
+b = Tensor(-7.0, label='b')
+x0w0 = x0 * w0; x0w0.label = 'x0w0'
+x1w1 = x1 * w1; x1w1.label = 'x1w1'
+x0w0x1w1 = x0w0 + x1w1; x0w0x1w1.label = 'x0w0x1w1'
+Sum = x0w0x1w1 + b; Sum.label = 'Sum'
+output = Sum.tanh(); output.label = 'output'
+output.backward()
+
+dot = draw_dot(output)
+dot.render("./bp_result/tanh1", view=True)
+```
+![tanh1](./bp_result/tanh1.svg)
+
+
+### 将 tanh 按公式拆分后调用
+
+```python
+x0 = Tensor(1.0, label='x0')
+w0 = Tensor(2.0, label='w0')
+x1 = Tensor(3.0, label='x1')
+w1 = Tensor(4.0, label='w1')
+b = Tensor(-7.0, label='b')
+x0w0 = x0 * w0; x0w0.label = 'x0w0'
+x1w1 = x1 * w1; x1w1.label = 'x1w1'
+x0w0x1w1 = x0w0 + x1w1; x0w0x1w1.label = 'x0w0x1w1'
+Sum = x0w0x1w1 + b; Sum.label = 'Sum'
+o = 2 * Sum
+exp = o.exp()
+output = (exp - 1) / (exp + 1)
+output.backward()
+
+dot = draw_dot(output)
+dot.render("./bp_result/tanh2", view=True)
+```
+
+在运行这段拆分代码之前，需要先为 `Tensor` 补充减法、除法等运算符重载，保证表达式能够完整执行，具体可以参考代码实现。
+
+这里需要注意，除法依赖幂运算（例如 `x / y -> x * y**-1`），所以要同时补上 `__pow__` 才能完整跑通。
+
+![tanh2](./bp_result/tanh2.svg)
+
+对比两种实现的运行结果可以发现：将 `tanh` 按表达式拆分后，最终的梯度回传结果保持一致，说明反向传播链路是正确的。
+
+另外如果图里看到很多 `0.0000`，有时候只是梯度很小再加上显示精度不够，我在这里的解决方式比较简单粗暴，将初始梯度从1增加到了1000。
 
 ## 附录:
 
@@ -287,3 +400,5 @@ https://github.com/karpathy/micrograd
 [Youtube课程原视频](https://www.youtube.com/watch?v=VMj-3S1tku0&list=PLAqhIrjkxbuWI23v9cThsA9GvCAUhRvKZ)
 
 [b站翻译版本](https://www.bilibili.com/video/BV1mqrTBvEaf/?spm_id_from=333.1007.top_right_bar_window_custom_collection.content.click&vd_source=758fb7e86b317eb62ce96b2962bc1d3a)
+
+https://zhuanlan.zhihu.com/p/30640636947
