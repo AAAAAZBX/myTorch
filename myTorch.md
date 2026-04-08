@@ -16,7 +16,7 @@ myTorch 是一个模仿 PyTorch 实现的深度学习库，主要用于实现aut
 
 反向传播（英语：Backpropagation，意为误差反向传播，缩写为BP）是对多层人工神经网络进行梯度下降的算法，也就是用链式法则以网络每层的权重为变量计算损失函数的梯度，以更新权重来最小化损失函数。
 
-## 构建 myTorch
+## 构建 myTorch 数据结构
 
 ### 定义数据结构 Tensor
 
@@ -44,7 +44,7 @@ c = Tensor(3.0)
 
 d = a * b + c # (a.__mul__(b)).__add__(c)
 
-print(d) # Tensor(data=6.0)
+print(d) # Tensor(data=5.0)
 ```
 
 现在在这个表达式的基础上添加联系组织，用于保留有关哪些值产生了哪些其他值的指针。
@@ -70,7 +70,7 @@ class Tensor:
 
 这样便可以知道每个值的子项，并且能够追溯到是哪个运算操作生成了这个值。
 
-为了更加直观地可视化整个计算图，要在类中加入 label 来标识各个变量名，使用下面的代码.
+为了更加直观地可视化整个计算图，要在类中加入 label 来标识各个变量名，使用下面的代码.(具体实现方式可以不必深究，知道其能够显示计算图的拓扑顺序即可)
 
 ```python
 def trace(root):
@@ -103,6 +103,179 @@ def draw_dot(root, format='svg', rankdir='LR'):
         dot.edge(str(id(n1)), str(id(n2)) + n2._op)
     
     return dot
+```
+
+调用下面的方法便可以得到整张计算图之间各个变量，以及运算符之间的联系
+
+```python
+a = Tensor(1.0, label='a')
+b = Tensor(2.0, label='b')
+c = Tensor(3.0, label='c')
+e = a * b
+e.label = 'e'
+d = e + c
+d.label = 'd'
+
+print(d) # Tensor(data=5.0)
+dot = draw_dot(d)
+dot.render("tensor_graph", view=True)
+```
+
+运行结果:
+
+![tensor_graph](./tensor_graph.svg)
+
+## 反向传播
+
+### 链式法则
+
+根据上面的式子 $d = a \times b + c$，可以用偏导来衡量每个输入变量对输出 $d$ 的影响：
+
+$$
+\frac{\partial d}{\partial a} = b,\quad
+\frac{\partial d}{\partial b} = a,\quad
+\frac{\partial d}{\partial c} = 1
+$$
+
+这三个结果的含义分别是：
+- $\frac{\partial d}{\partial a}=b$：当 $a$ 增大一点点时，$d$ 的变化率由当前的 $b$ 决定。
+- $\frac{\partial d}{\partial b}=a$：当 $b$ 增大一点点时，$d$ 的变化率由当前的 $a$ 决定。
+- $\frac{\partial d}{\partial c}=1$：$c$ 与 $d$ 是线性相加关系，$c$ 增加多少，$d$ 就增加多少。
+
+为了更直观的理解偏导的意义，可以从以下几个例子来解释：
+
+```python
+def diff_on_a():
+    h = 0.0001
+
+    a = Tensor(1.0, label='a')
+    b = Tensor(2.0, label='b')
+    c = Tensor(3.0, label='c')
+    e = a * b
+    e.label = 'e'
+    d1 = e + c
+    d1.label = 'd1'
+
+    a = Tensor(1.0 + h, label='a')
+    b = Tensor(2.0, label='b')
+    c = Tensor(3.0, label='c')
+    e = a * b
+    e.label = 'e'
+    d2 = e + c
+    d2.label = 'd2'
+
+    print((d2.data - d1.data) / h)  # 约等于 2.0（即当前 b 的值）
+
+
+def diff_on_b():
+    h = 0.0001
+
+    a = Tensor(1.0, label='a')
+    b = Tensor(2.0, label='b')
+    c = Tensor(3.0, label='c')
+    d1 = a * b + c
+
+    a = Tensor(1.0, label='a')
+    b = Tensor(2.0 + h, label='b')
+    c = Tensor(3.0, label='c')
+    d2 = a * b + c
+
+    print((d2.data - d1.data) / h)  # 约等于 1.0（即当前 a 的值）
+
+
+def diff_on_c():
+    h = 0.0001
+
+    a = Tensor(1.0, label='a')
+    b = Tensor(2.0, label='b')
+    c = Tensor(3.0, label='c')
+    d1 = a * b + c
+
+    a = Tensor(1.0, label='a')
+    b = Tensor(2.0, label='b')
+    c = Tensor(3.0 + h, label='c')
+    d2 = a * b + c
+
+    print((d2.data - d1.data) / h)  # 约等于 1.0
+```
+
+上面三个函数分别对应对 $a$、$b$、$c$ 做微小扰动：
+- 对 $a$ 扰动时，变化率约等于 $b$；
+- 对 $b$ 扰动时，变化率约等于 $a$；
+- 对 $c$ 扰动时，变化率恒为 $1$。
+
+
+
+
+这些结果说明了一个核心事实：每个局部变化率都可以通过链式法则一路传递到最终输出，这正是反向传播的本质。  
+接下来将不再用数值扰动估计梯度，而是基于计算图实现自动反向传播。
+
+### 链式法则到反向传播
+
+对于复合表达式，梯度可以写成局部导数的连乘：
+
+$$
+\frac{\partial L}{\partial x}
+=
+\frac{\partial L}{\partial u}
+\cdot
+\frac{\partial u}{\partial x}
+$$
+
+在计算图中，我们从最终输出节点出发，按拓扑逆序依次回传每个节点的梯度，并把梯度累加到其父节点上。
+
+### 反向传播代码实现
+
+```python
+class Tensor:
+    def __init__(self, data, _children=(), _op='', label=None):
+        self.data = data
+        self.grad = 0.0
+        self._prev = set(_children)
+        self._op = _op
+        self.label = label
+        self._backward = lambda: None
+
+    def __repr__(self):
+        return f"Tensor(data={self.data})"
+
+    def __add__(self, other):
+        out = Tensor(self.data + other.data, (self, other), '+')
+        def _backward():
+            # z = x + y, dz/dx = 1, dz/dy = 1
+            # 把 out 的梯度原样分配给两个输入节点
+            self.grad += out.grad
+            other.grad += out.grad
+        out._backward = _backward
+        return out
+
+    def __mul__(self, other):
+        out = Tensor(self.data * other.data, (self, other), '*')
+        def _backward():
+            # z = x * y, dz/dx = y, dz/dy = x
+            # 按链式法则乘以上游梯度 out.grad
+            self.grad += other.data * out.grad
+            other.grad += self.data * out.grad
+        out._backward = _backward
+        return out
+
+    # backward 核心流程：
+    # 1) 从当前输出节点出发构建拓扑序
+    # 2) 将输出节点梯度设为 1.0（即 dd/dd = 1）
+    # 3) 按拓扑逆序调用每个节点的局部 _backward，实现链式法则回传
+    def backward(self):
+        topo = []
+        visited = set()
+        def build_topo(v):
+            if v not in visited:
+                visited.add(v)
+                for child in v._prev:
+                    build_topo(child)
+                topo.append(v)
+        build_topo(self)
+        self.grad = 1.0
+        for v in reversed(topo):
+            v._backward()
 ```
 
 
